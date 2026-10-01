@@ -8,7 +8,9 @@ stage stops that skill (or task) and is recorded in <run>/driver_failures.jsonl,
 automatic retry; the one exception is a GPU job that APPL's launcher refused because the
 selected GPU had less than 2 GiB free (it never started), which is retried every five minutes.
 A stage that an earlier driver left running is waited for, never launched twice. Agent
-sessions and GPU jobs run with bounded concurrency.
+sessions and GPU jobs run with bounded concurrency. Disk: the 2-update checkpoint of a finished
+`check_policy` job (about 365 MB, never read again; the check result is kept in the journal)
+is deleted, and no stage starts while the user's quota has less than --min-free-gb left.
 
 Usage:
   python scripts/exp2_construct.py --root runs/exp2_skillforge --prompt-system skillforge \
@@ -18,6 +20,7 @@ Usage:
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -29,6 +32,32 @@ MANIFEST = ROOT/'environments/exp2/pixi.toml'
 FULL_GPU = 'Selected GPU has less than 2 GiB free'
 TASKS = ('drawer_exchange', 'buffer_swap', 'constrained_retrieve_store', 'covered_peg_assembly',
          'granular_pour_return')
+
+
+def quota_free_gb():
+    """Space left under the user's disk quota (falls back to the filesystem's free space)."""
+    try:
+        out = subprocess.run(['quota', '-w', '-p'], capture_output=True, text=True).stdout.split('\n')
+        row = next(line.split() for line in out if line.strip().startswith('/dev/'))
+        used, limit = int(row[1].rstrip('*')), int(row[3])
+        if limit:
+            return (limit - used) / 2**20
+    except (OSError, StopIteration, ValueError, IndexError):
+        pass
+    stat = os.statvfs(ROOT)
+    return stat.f_bavail * stat.f_frsize / 2**30
+
+
+def janitor(root):
+    """Delete checkpoints of finished check_policy jobs (their results stay in the journal)."""
+    while True:
+        for checkpoint in Path(root).glob('*/policies/*/checks/*/last.pt'):
+            if (checkpoint.parent/'result.json').exists():
+                checkpoint.unlink(missing_ok=True)
+        for checkpoint in Path(root).glob('*/refinement/policies/*/checks/*/last.pt'):
+            if (checkpoint.parent/'result.json').exists():
+                checkpoint.unlink(missing_ok=True)
+        time.sleep(120)
 
 
 class Driver:
@@ -49,6 +78,9 @@ class Driver:
             time.sleep(60)
         if marker.exists():
             return
+        while quota_free_gb() < self.args.min_free_gb:
+            self.note(run, 'disk_wait', label=label, free_gb=round(quota_free_gb(), 1))
+            time.sleep(300)
         logs = run/'driver_logs'
         logs.mkdir(parents=True, exist_ok=True)
         cmd = ['pixi', 'run', '--manifest-path', str(MANIFEST), '--locked', 'python', '-m', *signature.split(' ')]
@@ -139,11 +171,13 @@ def main():
     parser.add_argument('--tasks', nargs='*', default=list(TASKS), choices=TASKS)
     parser.add_argument('--sessions', type=int, default=4, help='concurrent agent sessions')
     parser.add_argument('--per-gpu', type=int, default=3, help='concurrent training/verification jobs per GPU')
+    parser.add_argument('--min-free-gb', type=float, default=15, help='start no stage below this much quota left')
     args = parser.parse_args()
     args.gpu = {k: int(v) for k, v in (item.split('=') for item in args.gpu)}
     missing = set(args.tasks) - set(args.gpu)
     if missing:
         parser.error('No GPU for: '+', '.join(sorted(missing)))
+    threading.Thread(target=janitor, args=(args.root,), daemon=True).start()
     driver = Driver(args)
     with ThreadPoolExecutor(len(args.tasks)) as pool:
         list(pool.map(driver.task, args.tasks))
