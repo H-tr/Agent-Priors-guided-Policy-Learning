@@ -12,6 +12,11 @@ sessions and GPU jobs run with bounded concurrency. Disk: the 2-update checkpoin
 `check_policy` job (about 365 MB, never read again; the check result is kept in the journal)
 is deleted, and no stage starts while the user's quota has less than --min-free-gb left.
 
+Restart rule (both arms): a design, revision or final-guidance session that ends without
+finishing its stage is restarted once from scratch. The ended session's files are moved to
+<resets>/<arm>/<task>/<skill>/<stage>_attempt1 and the restart is logged in
+<resets>/resets.jsonl; a second failure is final.
+
 Usage:
   python scripts/exp2_construct.py --root runs/exp2_skillforge --prompt-system skillforge \
       --backend codex [--model gpt-6-sol] --gpu drawer_exchange=1 --gpu buffer_swap=3 ... \
@@ -137,18 +142,46 @@ class Driver:
 
     def skill(self, run, gpu, skill):
         try:
-            self.run(run, f'design_{skill}', 'design', '--skill', skill, slot=self.sessions,
-                     marker=run/'skills'/skill/'submission.json')
+            self.agent_stage(run, skill, 'design', run/'skills'/skill/'submission.json',
+                             [run/'skills'/skill, *sorted((run/'policies').glob(f'{skill}__h0[123]'))])
             self.policies(run, gpu, [f'{skill}__h0{i}' for i in (1, 2, 3)])
-            self.run(run, f'refine_{skill}', 'refine', '--skill', skill, slot=self.sessions,
-                     marker=run/'refinement/skills'/skill/'submission.json')
+            self.agent_stage(run, skill, 'refine', run/'refinement/skills'/skill/'submission.json',
+                             [run/'refinement/skills'/skill, run/'refinement/policies'/f'{skill}__h04'])
             self.policies(run, gpu, [f'{skill}__h04'])
-            self.run(run, f'finalize_{skill}', 'finalize', '--skill', skill, slot=self.sessions,
-                     marker=run/'library'/skill/'receipt.json')
+            self.agent_stage(run, skill, 'finalize', run/'library'/skill/'receipt.json', [run/'library'/skill])
             return True
         except Exception as error:  # one skill's failure does not stop the others
             self.note(run, 'skill_failed', skill=skill, error=str(error))
             return False
+
+    def agent_stage(self, run, skill, stage, marker, owned):
+        """Run an agent stage; restart it once from scratch if it ends without finishing."""
+        label = f'{stage}_{skill}'
+        arm = run.parent.name
+        try:
+            self.run(run, label, stage, '--skill', skill, slot=self.sessions, marker=marker)
+            return
+        except RuntimeError as error:
+            resets = Path(self.args.resets)
+            log = resets/'resets.jsonl'
+            done = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+            if any(r.get('kind') == 'agent_session_restart' and r.get('arm') == arm and r.get('task') == run.name
+                   and r.get('skill') == skill and r.get('stage') == stage for r in done):
+                raise
+            # Locked rows never move under a live session: the stage process has exited here.
+            dest = resets/arm/run.name/skill/f'{stage}_attempt1'
+            dest.mkdir(parents=True, exist_ok=False)
+            moved = []
+            for path in owned:
+                if path.exists():
+                    path.rename(dest/path.name)
+                    moved.append(str(path))
+            with self.lock, log.open('a') as stream:
+                stream.write(json.dumps(dict(time=time.strftime('%Y-%m-%dT%H:%M:%S'), arm=arm, task=run.name,
+                    kind='agent_session_restart', skill=skill, stage=stage, error=str(error)[:300], moved=moved,
+                    reason='session ended without finishing its stage; restarted once (standing rule, both arms)'))+'\n')
+            self.note(run, 'agent_session_restart', label=label)
+        self.run(run, label, stage, '--skill', skill, slot=self.sessions, marker=marker)
 
     def policies(self, run, gpu, identifiers):
         def one(policy):
@@ -174,9 +207,12 @@ def main():
     parser.add_argument('--per-gpu', type=int, default=3, help='concurrent training/verification jobs per GPU')
     parser.add_argument('--gpu-slots', action='append', default=[], help='index=jobs, overrides --per-gpu for one GPU')
     parser.add_argument('--min-free-gb', type=float, default=15, help='start no stage below this much quota left')
+    parser.add_argument('--resets', help='archive and log of restarted sessions (default: <root parent>_resets)')
     args = parser.parse_args()
     args.gpu = {k: int(v) for k, v in (item.split('=') for item in args.gpu)}
     args.gpu_slots = {int(k): int(v) for k, v in (item.split('=') for item in args.gpu_slots)}
+    root = Path(args.root).resolve()
+    args.resets = args.resets or str(root.parent.with_name(root.parent.name+'_resets'))
     missing = set(args.tasks) - set(args.gpu)
     if missing:
         parser.error('No GPU for: '+', '.join(sorted(missing)))
