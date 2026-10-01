@@ -1,0 +1,3 @@
+## Call policies through their priors
+
+Each policy's priors are its interface. Before a call, ground the candidate policy's priors in the current state: which objects, frames or quantities fill its roles, and whether the situation lies inside its measured support. Choose a policy whose priors hold here, set its arguments from that grounding, and check the measured effect. When a call fails, decide which layer failed: the policy (its prior did not hold, or it did not achieve the effect; then prefer a sibling whose prior covers the observed condition) or your call (the choice, arguments or order were wrong; then correct those). Record that diagnosis in the notebook.

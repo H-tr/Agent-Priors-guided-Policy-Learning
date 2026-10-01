@@ -1,0 +1,1 @@
+Write each policy's guidance as its prior card for the runtime agent: the priors it relies on, the grounding it needs in the current state, the validated argument range, where its priors held in validation (with the measured numbers) and where they broke, and how to call it and recognize its outcome.
