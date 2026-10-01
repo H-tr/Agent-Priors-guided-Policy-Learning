@@ -9,7 +9,8 @@ automatic retry. Agent sessions and GPU jobs run with bounded concurrency.
 
 Usage:
   python scripts/exp2_construct.py --root runs/exp2_skillforge --prompt-system skillforge \
-      --backend codex --gpu drawer_exchange=1 --gpu buffer_swap=3 ... [--sessions 4] [--per-gpu 3]
+      --backend codex [--model gpt-6-sol] --gpu drawer_exchange=1 --gpu buffer_swap=3 ... \
+      [--sessions 4] [--per-gpu 3]
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -62,7 +63,8 @@ class Driver:
         if not (run/'configuration.json').exists():
             subprocess.run(['pixi', 'run', '--manifest-path', str(MANIFEST), '--locked', 'python', '-m',
                             'appl.construction', 'init', '--task', task, '--output', str(run), '--gpu', str(gpu),
-                            '--backend', self.args.backend, '--prompt-system', self.args.prompt_system],
+                            '--backend', self.args.backend, '--prompt-system', self.args.prompt_system,
+                            *(['--model', self.args.model] if self.args.model else [])],
                            cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
         if not (run/'cut/manifest.json').exists():
             self.run(run, 'cut', 'cut', slot=self.sessions)
@@ -104,6 +106,7 @@ def main():
     parser.add_argument('--root', required=True)
     parser.add_argument('--prompt-system', choices=('appl', 'skillforge'), required=True)
     parser.add_argument('--backend', choices=('responses', 'codex'), required=True)
+    parser.add_argument('--model', help='model for every agent session (default: the paper model)')
     parser.add_argument('--gpu', action='append', required=True, help='task=index')
     parser.add_argument('--tasks', nargs='*', default=list(TASKS), choices=TASKS)
     parser.add_argument('--sessions', type=int, default=4, help='concurrent agent sessions')
