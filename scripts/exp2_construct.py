@@ -5,7 +5,10 @@ verify h01-h03, refine (h04), train and verify h04, finalize. Stages are the
 `python -m appl.construction` commands of experiments/exp2/construction.md, run through the
 locked Exp2 environment. A finished stage is recognized by its output and skipped; a failed
 stage stops that skill (or task) and is recorded in <run>/driver_failures.jsonl, without an
-automatic retry. Agent sessions and GPU jobs run with bounded concurrency.
+automatic retry; the one exception is a GPU job that APPL's launcher refused because the
+selected GPU had less than 2 GiB free (it never started), which is retried every five minutes.
+A stage that an earlier driver left running is waited for, never launched twice. Agent
+sessions and GPU jobs run with bounded concurrency.
 
 Usage:
   python scripts/exp2_construct.py --root runs/exp2_skillforge --prompt-system skillforge \
@@ -16,12 +19,14 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
+import re
 import subprocess
 import threading
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT/'environments/exp2/pixi.toml'
+FULL_GPU = 'Selected GPU has less than 2 GiB free'
 TASKS = ('drawer_exchange', 'buffer_swap', 'constrained_retrieve_store', 'covered_peg_assembly',
          'granular_pour_return')
 
@@ -37,21 +42,45 @@ class Driver:
         with self.lock:
             return self.gpus.setdefault(index, threading.BoundedSemaphore(self.args.per_gpu))
 
-    def run(self, run, label, stage, *extra, slot):
+    def run(self, run, label, stage, *extra, slot, marker):
+        """Run one stage unless ``marker`` shows it is done; never run a stage twice at once."""
+        signature = ' '.join(['appl.construction', stage, '--run', str(run), *extra])
+        while self.running(signature):
+            time.sleep(60)
+        if marker.exists():
+            return
         logs = run/'driver_logs'
         logs.mkdir(parents=True, exist_ok=True)
-        cmd = ['pixi', 'run', '--manifest-path', str(MANIFEST), '--locked', 'python', '-m',
-               'appl.construction', stage, '--run', str(run), *extra]
-        with slot:
-            started = time.time()
-            self.note(run, 'start', label=label)
-            with (logs/(label+'.log')).open('a') as stream:
-                code = subprocess.run(cmd, cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT).returncode
-            self.note(run, 'end', label=label, code=code, seconds=round(time.time()-started))
+        cmd = ['pixi', 'run', '--manifest-path', str(MANIFEST), '--locked', 'python', '-m', *signature.split(' ')]
+        while True:
+            with slot:
+                started = time.time()
+                self.note(run, 'start', label=label)
+                with (logs/(label+'.log')).open('a') as stream:
+                    code = subprocess.run(cmd, cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT).returncode
+                self.note(run, 'end', label=label, code=code, seconds=round(time.time()-started))
+            if code and stage in ('train', 'verify') and self.gpu_was_full(logs/(label+'.log')):
+                self.note(run, 'gpu_full_retry', label=label)
+                time.sleep(300)
+                continue
+            break
         if code:
             with (run/'driver_failures.jsonl').open('a') as stream:
                 stream.write(json.dumps(dict(label=label, code=code, time=time.time()))+'\n')
             raise RuntimeError(f'{run.name}: {label} failed ({code}); see driver_logs/{label}.log')
+
+    @staticmethod
+    def gpu_was_full(log):
+        """The launcher's refusal is written to the worker log the stage log points to."""
+        tail = log.read_text()[-4000:]
+        texts = [tail] + [Path(p).read_text()[-4000:] for p in re.findall(r'inspect (\S+worker\.log)', tail)
+                          if Path(p).exists()]
+        return any(FULL_GPU in text for text in texts)
+
+    @staticmethod
+    def running(signature):
+        listing = subprocess.run(['pgrep', '-af', 'appl.construction'], capture_output=True, text=True).stdout
+        return any(line.endswith(signature) or signature+' ' in line for line in listing.splitlines())
 
     def note(self, run, kind, **payload):
         line = json.dumps(dict(task=run.name, kind=kind, time=time.strftime('%H:%M:%S'), **payload))
@@ -66,8 +95,7 @@ class Driver:
                             '--backend', self.args.backend, '--prompt-system', self.args.prompt_system,
                             *(['--model', self.args.model] if self.args.model else [])],
                            cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
-        if not (run/'cut/manifest.json').exists():
-            self.run(run, 'cut', 'cut', slot=self.sessions)
+        self.run(run, 'cut', 'cut', slot=self.sessions, marker=run/'cut/manifest.json')
         skills = [row['skill_id'] for row in json.loads((run/'cut/manifest.json').read_text())['datasets']]
         with ThreadPoolExecutor(len(skills)) as pool:
             outcomes = list(pool.map(lambda skill: self.skill(run, gpu, skill), skills))
@@ -76,14 +104,14 @@ class Driver:
 
     def skill(self, run, gpu, skill):
         try:
-            if not (run/'skills'/skill/'submission.json').exists():
-                self.run(run, f'design_{skill}', 'design', '--skill', skill, slot=self.sessions)
+            self.run(run, f'design_{skill}', 'design', '--skill', skill, slot=self.sessions,
+                     marker=run/'skills'/skill/'submission.json')
             self.policies(run, gpu, [f'{skill}__h0{i}' for i in (1, 2, 3)])
-            if not (run/'refinement/skills'/skill/'submission.json').exists():
-                self.run(run, f'refine_{skill}', 'refine', '--skill', skill, slot=self.sessions)
+            self.run(run, f'refine_{skill}', 'refine', '--skill', skill, slot=self.sessions,
+                     marker=run/'refinement/skills'/skill/'submission.json')
             self.policies(run, gpu, [f'{skill}__h04'])
-            if not (run/'library'/skill/'receipt.json').exists():
-                self.run(run, f'finalize_{skill}', 'finalize', '--skill', skill, slot=self.sessions)
+            self.run(run, f'finalize_{skill}', 'finalize', '--skill', skill, slot=self.sessions,
+                     marker=run/'library'/skill/'receipt.json')
             return True
         except Exception as error:  # one skill's failure does not stop the others
             self.note(run, 'skill_failed', skill=skill, error=str(error))
@@ -92,10 +120,10 @@ class Driver:
     def policies(self, run, gpu, identifiers):
         def one(policy):
             base = run/('refinement' if policy.endswith('__h04') else '')/'policies'/policy
-            if not (base/'training/result.json').exists():
-                self.run(run, f'train_{policy}', 'train', '--policy', policy, slot=self.gpu(gpu))
-            if not (run/'verification'/policy/'receipt.json').exists():
-                self.run(run, f'verify_{policy}', 'verify', '--policy', policy, slot=self.gpu(gpu))
+            self.run(run, f'train_{policy}', 'train', '--policy', policy, slot=self.gpu(gpu),
+                     marker=base/'training/result.json')
+            self.run(run, f'verify_{policy}', 'verify', '--policy', policy, slot=self.gpu(gpu),
+                     marker=run/'verification'/policy/'receipt.json')
         with ThreadPoolExecutor(len(identifiers)) as pool:
             for future in [pool.submit(one, p) for p in identifiers]:
                 future.result()
