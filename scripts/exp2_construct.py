@@ -69,7 +69,8 @@ class Driver:
 
     def gpu(self, index):
         with self.lock:
-            return self.gpus.setdefault(index, threading.BoundedSemaphore(self.args.per_gpu))
+            slots = self.args.gpu_slots.get(index, self.args.per_gpu)
+            return self.gpus.setdefault(index, threading.BoundedSemaphore(slots))
 
     def run(self, run, label, stage, *extra, slot, marker):
         """Run one stage unless ``marker`` shows it is done; never run a stage twice at once."""
@@ -171,9 +172,11 @@ def main():
     parser.add_argument('--tasks', nargs='*', default=list(TASKS), choices=TASKS)
     parser.add_argument('--sessions', type=int, default=4, help='concurrent agent sessions')
     parser.add_argument('--per-gpu', type=int, default=3, help='concurrent training/verification jobs per GPU')
+    parser.add_argument('--gpu-slots', action='append', default=[], help='index=jobs, overrides --per-gpu for one GPU')
     parser.add_argument('--min-free-gb', type=float, default=15, help='start no stage below this much quota left')
     args = parser.parse_args()
     args.gpu = {k: int(v) for k, v in (item.split('=') for item in args.gpu)}
+    args.gpu_slots = {int(k): int(v) for k, v in (item.split('=') for item in args.gpu_slots)}
     missing = set(args.tasks) - set(args.gpu)
     if missing:
         parser.error('No GPU for: '+', '.join(sorted(missing)))
