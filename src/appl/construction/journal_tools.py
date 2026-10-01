@@ -50,9 +50,10 @@ class DesignTools:
             self.j.db.execute('INSERT INTO tools VALUES(?,?,?,?,?)', (cid, name, item['arguments'], 'started', None))
         try:
             result = self.dispatch(name, args)
-        except (ValueError, RuntimeError, KeyError, TypeError, SyntaxError) as error:
-            result = dict(error=str(error), repair_allowed=not self.done())
-            self.j.event('tool_diagnostic', name=name, error=str(error))
+        except Exception as error:  # e.g. a missing file or an invalid report: a diagnostic, not a crash
+            message = str(error) or type(error).__name__
+            result = dict(error=message, repair_allowed=not self.done())
+            self.j.event('tool_diagnostic', name=name, error=message)
         with self.j.db:
             self.j.db.execute('UPDATE tools SET status=?,result=? WHERE id=?', ('completed', encode(result), cid))
         return result

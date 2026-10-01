@@ -273,9 +273,9 @@ class DemonstrationProcessor:
             definition = {s['name']: s for s in self.schemas()}[name]
             jsonschema.validate(args, definition['parameters'])
             result = self.dispatch(name, args)
-        except (ValueError, KeyError, jsonschema.ValidationError) as error:
+        except Exception as error:  # e.g. a missing file: a diagnostic for the agent, not a crash
             # Bounded declared plan diagnostics, never transport retries or fallback decisions.
-            result = dict(error=str(error)[:4000], repair_allowed=not self.done())
+            result = dict(error=(str(error) or type(error).__name__)[:4000], repair_allowed=not self.done())
         with self.j.db:
             self.j.db.execute('UPDATE tools SET status=?,result=? WHERE id=?', ('completed', encode(result), cid))
         self.j.event('processing_tool_cost', name=name, elapsed_seconds=time.monotonic() - started)

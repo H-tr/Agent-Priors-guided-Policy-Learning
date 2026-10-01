@@ -149,8 +149,8 @@ class _Server:
             self.log.close()
 
 
-def plan_usage(server):
-    limits = server.request("account/rateLimits/read", {})
+def plan_usage(server, timeout=120):
+    limits = server.request("account/rateLimits/read", {}, timeout=timeout)
     primary = limits["rateLimits"]["primary"]
     return dict(used_percent=float(primary["usedPercent"]), resets_at=primary["resetsAt"],
                 ordinary_usage_allowed=bool(limits.get("ordinaryUsageAllowed", True)))
@@ -167,6 +167,33 @@ def _content(result):
         else:
             items.append(dict(type="inputText", text=part.get("text", encode(part))))
     return items
+
+
+def _finish(server, thread_id, turn_id, note, wait=60):
+    """Stop sampling once the tools are done; never fail a completed session.
+
+    Tool calls Codex still holds from the same response are declined (the Responses loop
+    would not have executed them either), so the interrupt cannot wait on them.
+    """
+    if turn_id:
+        server.next_id += 1
+        server.send(dict(jsonrpc="2.0", id=server.next_id, method="turn/interrupt",
+                         params=dict(threadId=thread_id, turnId=turn_id)))
+    deadline = time.monotonic() + wait
+    try:
+        while time.monotonic() < deadline:
+            event = server.read(deadline - time.monotonic())
+            if event is None:
+                continue
+            method = event.get("method")
+            if "id" in event and method:
+                if method == "item/tool/call":
+                    note("declined_after_done", tool=event.get("params", {}).get("tool"))
+                server.respond(event["id"], error=dict(code=-32000, message="The session is complete"))
+            elif method == "turn/completed":
+                return
+    except Exception as error:  # the session's outcome is already recorded by its tools
+        note("finish_warning", error=str(error))
 
 
 def run_session(loop, message, budget):
@@ -250,8 +277,7 @@ def run_session(loop, message, budget):
                      result=result if not isinstance(result, list) else "[content items]")
                 server.respond(event["id"], dict(contentItems=_content(result), success=success))
                 if tools.done():
-                    if turn_id:
-                        server.request("turn/interrupt", dict(threadId=thread_id, turnId=turn_id))
+                    _finish(server, thread_id, turn_id, note)
                     break
             elif "id" in event and method:
                 # Approvals or other requests for capabilities outside the APPL tools.
@@ -297,7 +323,7 @@ def run_session(loop, message, budget):
         return j.get("frozen")
     finally:
         try:
-            quota = plan_usage(server)
+            quota = plan_usage(server, timeout=30)
             j.event("codex_plan_usage", stage="end", **quota)
         except Exception:  # the session outcome matters more than the final usage read
             quota = None
