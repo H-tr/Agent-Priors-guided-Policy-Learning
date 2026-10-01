@@ -9,11 +9,13 @@ an episode directory without result.json is reported, never re-run automatically
   run:      python scripts/exp2_evaluate.py run --root runs/exp2_eval/skillforge \
                 --construction-root runs/exp2_skillforge --api-config codex.json --gpu 0 --gpu 3
   summary:  python scripts/exp2_evaluate.py summary --root runs/exp2_eval/skillforge [--root ...]
+  compare:  python scripts/exp2_evaluate.py compare --root runs/exp2_eval/appl --root runs/exp2_eval/skillforge
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import itertools
 import json
+import math
 from pathlib import Path
 import subprocess
 import threading
@@ -167,6 +169,56 @@ def summary(args):
                       f'{wins} only {name} succeeds, {losses} only {other_name} succeeds (first attainment)')
 
 
+def wilson(k, n, z=1.96):
+    if not n:
+        return (0.0, 0.0)
+    p = k/n
+    centre, half = p + z*z/(2*n), z*math.sqrt(p*(1-p)/n + z*z/(4*n*n))
+    return ((centre-half)/(1+z*z/n), (centre+half)/(1+z*z/n))
+
+
+def mcnemar(b, c):
+    """Exact two-sided McNemar p-value from the discordant pair counts."""
+    n = b + c
+    if not n:
+        return 1.0
+    tail = sum(math.comb(n, i) for i in range(0, min(b, c)+1)) / 2**n
+    return min(1.0, 2*tail)
+
+
+def compare(args):
+    """Paired comparison of two new arms (first attainment, the paper's metric; final state as well)."""
+    pub = {(e['suite'], e['task'], e['case_id']): bool(e['success']) for e in published()}
+    a_root, b_root = args.root
+    a, b = outcomes(a_root), outcomes(b_root)
+    na, nb = Path(a_root).name, Path(b_root).name
+    tasks = sorted({k[1] for k in pub})
+    print(f'| suite | task | published APPL | {na} | {nb} |')
+    print('| --- | --- | --- | --- | --- |')
+    for suite in SUITES:
+        for task in tasks:
+            keys = [k for k in pub if k[0] == suite and k[1] == task]
+            if not keys:
+                continue
+            cell = lambda rows: f"{sum(bool(rows[k].get('first_attainment_success', rows[k]['success'])) for k in keys if k in rows)}/{sum(k in rows for k in keys)}"
+            print(f"| {suite} | {task} | {sum(pub[k] for k in keys)}/{len(keys)} | {cell(a)} | {cell(b)} |")
+    print()
+    for metric, field in (('first attainment', 'first_attainment_success'), ('final state', 'success')):
+        print(f'### {metric}')
+        print(f'| suite | {na} | {nb} | paired cases | only {na} | only {nb} | exact McNemar p |')
+        print('| --- | --- | --- | --- | --- | --- | --- |')
+        for suite in (*SUITES, 'all'):
+            keys = [k for k in pub if (suite == 'all' or k[0] == suite) and k in a and k in b]
+            get = lambda rows, k: bool(rows[k].get(field, rows[k]['success'])) if field != 'success' else bool(rows[k]['success'])
+            ka, kb = sum(get(a, k) for k in keys), sum(get(b, k) for k in keys)
+            only_a = sum(get(a, k) and not get(b, k) for k in keys)
+            only_b = sum(get(b, k) and not get(a, k) for k in keys)
+            ia, ib = wilson(ka, len(keys)), wilson(kb, len(keys))
+            print(f'| {suite} | {ka}/{len(keys)} [{ia[0]:.2f}, {ia[1]:.2f}] | {kb}/{len(keys)} [{ib[0]:.2f}, {ib[1]:.2f}] '
+                  f'| {len(keys)} | {only_a} | {only_b} | {mcnemar(only_a, only_b):.3f} |')
+        print()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest='command', required=True)
@@ -180,8 +232,12 @@ def main():
     r.add_argument('--tasks', nargs='*', help='evaluate only these tasks')
     s = sub.add_parser('summary')
     s.add_argument('--root', action='append', default=[])
+    c = sub.add_parser('compare', help='paired comparison of exactly two roots')
+    c.add_argument('--root', action='append', required=True)
     args = parser.parse_args()
-    run(args) if args.command == 'run' else summary(args)
+    if args.command == 'compare' and len(args.root) != 2:
+        parser.error('compare needs exactly two --root')
+    {'run': run, 'summary': summary, 'compare': compare}[args.command](args)
 
 
 if __name__ == '__main__':
