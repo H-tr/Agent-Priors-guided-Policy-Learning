@@ -83,12 +83,17 @@ def library_ready(run):
     return all((run/'library'/skill/'receipt.json').exists() for skill in skills)
 
 
-def outcomes(root):
-    """Completed episodes, plus episodes whose agent exhausted its request budget.
+AGENT_ENDED = ('budget exhausted', 'idle beyond')
 
-    APPL's agent loop ends an episode that uses all its model requests without a result file
-    (only failure.json). That is the agent's outcome, scored unsuccessful at the final state;
-    first attainment is read from the per-step trace. Other errors stay unscored (incomplete).
+
+def outcomes(root):
+    """Completed episodes, plus episodes whose agent session ended without a result.
+
+    APPL's agent loop ends an episode whose agent uses all its model requests with failure.json
+    and no result file; under Codex a session can also stall after the agent's last action until
+    the idle timeout. Physics stopped with the agent, and every step's goal predicate is in the
+    trace, so such an episode is scored from it: first attainment if any step met the goal, and
+    final success from the last recorded step. Episodes that ended for other reasons stay unscored.
     """
     rows = {}
     for episode in published():
@@ -101,25 +106,27 @@ def outcomes(root):
             rows[key] = result
         elif (folder/'failure.json').exists():
             failure = json.loads((folder/'failure.json').read_text())
-            if 'budget exhausted' not in failure.get('error', ''):
+            reason = next((r for r in AGENT_ENDED if r in failure.get('error', '')), None)
+            if reason is None or not (folder/'trace.jsonl').exists():
                 continue
-            first = None
-            for trace in (folder/'api/trace.jsonl', folder/'trace.jsonl'):
-                if trace.exists():
-                    for line in trace.read_text().splitlines():
-                        event = json.loads(line)
-                        if (event.get('metrics') or {}).get('success'):
-                            first = event.get('step')
-                            break
-                    break
-            rows[key] = dict(success=False, first_attainment_success=first is not None, first_success_step=first,
-                             status='request_budget_exhausted', steps=failure.get('physical_steps'))
+            first = last = None
+            for line in (folder/'trace.jsonl').read_text().splitlines():
+                event = json.loads(line)
+                if 'metrics' not in event:
+                    continue
+                last = event
+                if first is None and event['metrics'].get('success'):
+                    first = event.get('step')
+            rows[key] = dict(success=bool(last and last['metrics'].get('success')),
+                             first_attainment_success=first is not None, first_success_step=first,
+                             status='request_budget_exhausted' if reason == 'budget exhausted' else 'session_stalled',
+                             steps=failure.get('physical_steps'))
     return rows
 
 
 def incomplete(root):
     return sorted(str(p.parent.relative_to(root)) for p in Path(root).glob('*/*/*/failure.json')
-                  if 'budget exhausted' not in json.loads(p.read_text()).get('error', ''))
+                  if not any(r in json.loads(p.read_text()).get('error', '') for r in AGENT_ENDED))
 
 
 def summary(args):
@@ -141,10 +148,13 @@ def summary(args):
         lines.append(f'| {name} | ' + ' | '.join(cells) + f' | {len(table)} |')
     print('\n'.join(lines))
     for root in args.root:
-        exhausted = sum(r.get('status') == 'request_budget_exhausted' for r in outcomes(root).values())
+        rows = outcomes(root).values()
+        exhausted = sum(r.get('status') == 'request_budget_exhausted' for r in rows)
+        stalled = sum(r.get('status') == 'session_stalled' for r in rows)
         missing = incomplete(root)
-        print(f'{Path(root).name}: {exhausted} episodes ended by the request budget (scored unsuccessful); '
-              f'{len(missing)} incomplete for other reasons' + (': '+', '.join(missing) if missing else ''))
+        print(f'{Path(root).name}: {exhausted} ended by the request budget and {stalled} by a stalled session '
+              f'(both scored from their step traces); {len(missing)} incomplete for other reasons'
+              + (': '+', '.join(missing) if missing else ''))
     if len(columns) > 1:
         for name, table in columns[1:]:
             for other_name, other in columns:
