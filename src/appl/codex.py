@@ -19,8 +19,9 @@ configuration, so a Codex run never shares an agent identity with an API run):
   ``CONTINUE`` after the Responses transport's bounded delays (at most seven times per
   session). A session that ended before its first tool call may be started again.
 
-Sampling requests are counted as tool calls plus model turns that end without one, against
-the same ``max_api_calls`` budget. Once ``tools.done()`` holds, the turn is interrupted so no
+Model requests are counted from Codex's per-response token-usage updates, against the same
+``max_api_calls`` budget; one request may carry several tool calls when Codex calls tools in
+parallel (the Responses loop requested one call per response). Once ``tools.done()`` holds, the turn is interrupted so no
 further sampling happens, as the Responses loop stops before its next request.
 """
 from __future__ import annotations
@@ -185,7 +186,7 @@ def run_session(loop, message, budget):
     schemas = tools.schemas()
     definitions = {s["name"]: s for s in schemas}
     server = _Server(workspace, root / "app_server.log")
-    calls = turns = retries = 0
+    calls = turns = retries = requests = 0
     usage = None
 
     def note(kind, **payload):
@@ -227,7 +228,7 @@ def run_session(loop, message, budget):
             method = event.get("method")
             params = event.get("params", {})
             if method == "item/tool/call":
-                if calls >= budget:
+                if requests >= budget:
                     server.respond(event["id"], error=dict(code=-32000, message="API call budget exhausted"))
                     raise ValueError("API call budget exhausted")
                 calls += 1
@@ -264,6 +265,9 @@ def run_session(loop, message, budget):
                     note(item["type"], item=item)
             elif method == "thread/tokenUsage/updated":
                 usage = params.get("tokenUsage")
+                requests += 1
+                j.set("codex_requests", j.get("codex_requests", 0) + 1)
+                note("request", n=requests, last=(usage or {}).get("last"))
             elif method == "account/rateLimits/updated":
                 limits = params.get("rateLimits", {}).get("primary") or {}
                 if limits and float(limits.get("usedPercent", 0)) >= 99:
@@ -285,7 +289,7 @@ def run_session(loop, message, budget):
                 turns += 1
                 if tools.done():
                     break
-                if calls + turns >= budget:
+                if requests >= budget:
                     raise ValueError("API call budget exhausted")
                 start_turn(CONTINUE)
             elif method == "error":
@@ -297,6 +301,6 @@ def run_session(loop, message, budget):
             j.event("codex_plan_usage", stage="end", **quota)
         except Exception:  # the session outcome matters more than the final usage read
             quota = None
-        j.event("codex_session", tool_calls=calls, continued_turns=turns, transient_retries=retries, usage=usage,
+        j.event("codex_session", requests=requests, tool_calls=calls, continued_turns=turns, transient_retries=retries, usage=usage,
                 done=bool(tools.done()), plan_usage=quota)
         server.close()
