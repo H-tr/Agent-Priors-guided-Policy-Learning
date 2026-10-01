@@ -133,9 +133,21 @@ class SkillTools(BaseSkillTools):
         self.plan_schema['properties']['priors'].update(minItems=3, maxItems=3)
 
     def schemas(self):
-        return extend_read_public(super().schemas(), [NAME, POSTURE])
+        result = extend_read_public(super().schemas(), [NAME, POSTURE])
+        if self.cfg.get('catalog_path'):
+            from .catalog import TOOL
+            result.append(TOOL)
+        return result
 
     def dispatch(self, name, args):
+        if name == 'read_catalog' and self.cfg.get('catalog_path'):
+            from . import catalog
+            result = catalog.read(self.cfg['catalog_path'], args['ids'])
+            if not args['ids']:
+                self.j.set('catalog_index_read', True)
+            return result
+        if name == 'submit_prior_plan' and self.cfg.get('catalog_path') and not self.j.get('catalog_index_read'):
+            raise ValueError('Read the prior catalog index (read_catalog with an empty list) before submitting the prior plan')
         if name == 'read_public' and args.get('name') in (NAME, POSTURE):
             seen = set(self.j.get('public_read', []))
             seen.add(args['name'])

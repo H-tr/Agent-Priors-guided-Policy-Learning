@@ -115,8 +115,9 @@ def refine(cfg, skill):
     if digest(norm) != digest(Path(cfg['output'])/'normalization.json'):
         raise ValueError('Refinement must use the identical full-demo normalizer')
     revision['output'] = str(root)
+    template = Path(cfg['prompts']['revision']).read_text() if 'revision' in cfg['prompts'] else SKILL_REVISION
     return run_skill_revision(cfg['task_id'], revision, skill_item(cfg, skill), originals,
-                              validation, SKILL_REVISION.format(skill=skill))
+                              validation, template.format(skill=skill))
 
 
 def finalize(cfg, skill):
@@ -128,7 +129,8 @@ def finalize(cfg, skill):
     if (folder/'receipt.json').exists():
         verify_library_files(folder)
         return read(folder/'catalogue.json')
-    report = run_final(cfg, folder, policies, validation, FINAL, max_api_calls=24)
+    prompt = Path(cfg['prompts']['final']).read_text() if 'final' in cfg['prompts'] else FINAL
+    report = run_final(cfg, folder, policies, validation, prompt, max_api_calls=24)
     return publish_library(cfg, skill, policies, validation, report)
 
 

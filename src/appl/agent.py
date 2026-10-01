@@ -48,13 +48,16 @@ class AgentLoop:
             if previous and previous != context:
                 raise ValueError("Agent/tools/provider changed during resumption")
             j.set("agent_identity", context)
-            if j.get("history") is None:
-                j.set("history", [dict(role="user", content=encode(message))])
             budget = (
                 self.tools.budget.max_api_calls
                 if max_calls is None
                 else min(max_calls, self.tools.budget.max_api_calls)
             )
+            if getattr(self.client, "codex", False):
+                from .codex import run_session
+                return run_session(self, message, budget)
+            if j.get("history") is None:
+                j.set("history", [dict(role="user", content=encode(message))])
             while True:
                 pending = j.db.execute(
                     "SELECT * FROM api WHERE status!='consumed' ORDER BY seq LIMIT 1"

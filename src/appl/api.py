@@ -124,6 +124,11 @@ class ResponsesClient:
 def client(config, journal_root):
     """Build a client without reading credentials or making any network request."""
     api = config.get("api", config)
+    if api.get("backend") == "codex":
+        from .codex import CodexClient
+        return CodexClient(journal_root, model=os.environ.get("OPENAI_MODEL", api.get("model", "gpt-5.6-sol")),
+                           reasoning_effort=api.get("reasoning_effort", "xhigh"),
+                           timeout_seconds=api.get("timeout_seconds", 1800))
     return ResponsesClient(journal_root,
         model=os.environ.get("OPENAI_MODEL", api.get("model", "gpt-5.6-sol")),
         reasoning_effort=api.get("reasoning_effort", "xhigh"),

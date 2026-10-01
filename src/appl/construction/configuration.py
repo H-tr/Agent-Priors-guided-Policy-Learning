@@ -7,9 +7,14 @@ from appl.benchmark.artifacts import Artifacts
 from appl.benchmark.registry import TASKS
 
 
-def create(task, output, root=ROOT, gpu=0, model=None):
+PROMPT_SYSTEMS = ('appl', 'skillforge')
+
+
+def create(task, output, root=ROOT, gpu=0, model=None, backend='responses', prompt_system='appl'):
     if task not in TASKS:
         raise ValueError('Choose one of the five published tasks')
+    if backend not in ('responses', 'codex') or prompt_system not in PROMPT_SYSTEMS:
+        raise ValueError('Unknown backend or prompt system')
     assets = Artifacts(root)
     base = assets.root/'assets/exp2/tasks'/task
     original = assets.verified_json(base.relative_to(assets.root)/'without_verification.json')
@@ -54,11 +59,26 @@ def create(task, output, root=ROOT, gpu=0, model=None):
         target = inputs/path.name
         shutil.copyfile(path, target)
         resolved[key] = str(target)
+    from .prompts import SKILL_REVISION, FINAL
+    stage_text = dict(cut=cut_prompt.read_text(), train=train_prompt.read_text(), hl=hl_prompt.read_text(),
+                      revision=SKILL_REVISION, final=FINAL)
+    addenda = ROOT/'experiments/exp2/prompt_systems'/prompt_system
+    if prompt_system != 'appl':
+        # Each stage keeps the published APPL text and appends the system's section.
+        for key in stage_text:
+            addendum = addenda/(key+'.md')
+            stage_text[key] = stage_text[key].rstrip('\n')+'\n\n'+addendum.read_text()
+            original_hashes[str(addendum.relative_to(ROOT))] = digest(addendum)
     prompts = {}
-    for key, path in (('cut', cut_prompt), ('train', train_prompt), ('hl', hl_prompt)):
+    for key, text in stage_text.items():
         target = inputs/(key+'.md')
-        shutil.copyfile(path, target)
+        target.write_text(text)
         prompts[key] = str(target)
+    if prompt_system == 'skillforge':
+        catalog = ROOT/'prompts/skillforge/PRIOR_CATALOG.md'
+        shutil.copyfile(catalog, inputs/catalog.name)
+        resolved['catalog_path'] = str(inputs/catalog.name)
+        original_hashes[str(catalog.relative_to(ROOT))] = digest(catalog)
     shutil.copyfile(base/'normalization.json', output/'normalization.json')
     kinematics = {}
     for name in ('panda_kinematics.py', 'panda_posture.py'):
@@ -70,11 +90,13 @@ def create(task, output, root=ROOT, gpu=0, model=None):
         else:
             kinematics['posture'] = record
     api = dict(model=model or original['api']['model'], reasoning_effort='xhigh')
+    if backend == 'codex':
+        api['backend'] = 'codex'
     cfg = dict(schema='appl.construction.v1', task_id=task, asset_root=str(assets.root), output=str(output),
                dataset=str(output/'cut'), gpu=gpu, api=api, sources=sources, prompts=prompts,
                training=copy.deepcopy(original['training']), design=copy.deepcopy(original['design']),
                segmentation=copy.deepcopy(original['segmentation']), kinematics=kinematics,
-               published_result=False, test_feedback_used=False, **resolved)
+               published_result=False, test_feedback_used=False, prompt_system=prompt_system, **resolved)
     cfg['framework_sha256'] = framework_hash()
     cfg['input_files'] = {str(p.relative_to(output)): digest(p) for p in inputs.iterdir() if p.is_file()}
     cfg['input_files']['normalization.json'] = digest(output/'normalization.json')

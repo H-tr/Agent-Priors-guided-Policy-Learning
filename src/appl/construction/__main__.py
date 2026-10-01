@@ -16,6 +16,10 @@ def main(argv=None):
     init.add_argument('--asset-root', default=str(ROOT))
     init.add_argument('--gpu', type=int, default=0)
     init.add_argument('--model', help='Default follows the paper; OPENAI_MODEL can override transport')
+    init.add_argument('--backend', choices=('responses', 'codex'), default='responses',
+                      help='responses: the Responses API (OPENAI_API_KEY); codex: the local Codex login via codex app-server')
+    init.add_argument('--prompt-system', choices=('appl', 'skillforge'), default='appl',
+                      help='appl: the published prompts; skillforge: each stage plus its SkillForge section and the prior catalog')
     for name in ('inspect', 'cut', 'design', 'train', 'verify', 'refine', 'finalize'):
         stage = sub.add_parser(name)
         stage.add_argument('--run', required=True)
@@ -27,7 +31,8 @@ def main(argv=None):
             stage.add_argument('--dry-run', action='store_true', help='Validate prerequisites without API or GPU execution')
     args = parser.parse_args(argv)
     if args.stage == 'init':
-        result = create(args.task, args.output, args.asset_root, args.gpu, args.model)
+        result = create(args.task, args.output, args.asset_root, args.gpu, args.model, args.backend,
+                        args.prompt_system)
         print(json.dumps(dict(run=result['output'], task=result['task_id'], stage='initialized',
                               api_calls=0, gpu_jobs=0), indent=2))
         return
