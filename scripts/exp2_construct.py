@@ -65,6 +65,41 @@ def janitor(root):
         time.sleep(120)
 
 
+class GpuSlot:
+    """A machine-wide cap on our training/verification jobs per GPU, across both arms and all
+    drivers: running stage processes are counted, so jobs left by an earlier driver count too."""
+    pattern = re.compile(r'/python -m appl\.construction (?:train|verify) --run (\S+) ')
+    gpus = {}
+
+    def __init__(self, index, limit):
+        self.index, self.limit = index, limit
+        self.lock = threading.Lock()
+
+    @classmethod
+    def gpu_of(cls, run):
+        if run not in cls.gpus:
+            cls.gpus[run] = json.loads((Path(run)/'configuration.json').read_text())['gpu']
+        return cls.gpus[run]
+
+    def busy(self):
+        listing = subprocess.run(['ps', '-eo', 'args='], capture_output=True, text=True).stdout
+        runs = [m.group(1) for m in map(self.pattern.search, listing.splitlines()) if m]
+        return sum(self.gpu_of(r) == self.index for r in runs)
+
+    def __enter__(self):
+        while True:
+            self.lock.acquire()
+            if self.busy() < self.limit:
+                # Keep the next launch waiting until this job's process is visible to busy().
+                threading.Timer(10, self.lock.release).start()
+                return self
+            self.lock.release()
+            time.sleep(30)
+
+    def __exit__(self, *exc):
+        return False
+
+
 class Driver:
     def __init__(self, args):
         self.args = args
@@ -74,8 +109,7 @@ class Driver:
 
     def gpu(self, index):
         with self.lock:
-            slots = self.args.gpu_slots.get(index, self.args.per_gpu)
-            return self.gpus.setdefault(index, threading.BoundedSemaphore(slots))
+            return self.gpus.setdefault(index, GpuSlot(index, self.args.gpu_slots.get(index, self.args.per_gpu)))
 
     def run(self, run, label, stage, *extra, slot, marker):
         """Run one stage unless ``marker`` shows it is done; never run a stage twice at once."""
@@ -204,7 +238,8 @@ def main():
     parser.add_argument('--gpu', action='append', required=True, help='task=index')
     parser.add_argument('--tasks', nargs='*', default=list(TASKS), choices=TASKS)
     parser.add_argument('--sessions', type=int, default=4, help='concurrent agent sessions')
-    parser.add_argument('--per-gpu', type=int, default=3, help='concurrent training/verification jobs per GPU')
+    parser.add_argument('--per-gpu', type=int, default=3,
+                        help='running training/verification jobs per GPU, counted machine-wide over both arms')
     parser.add_argument('--gpu-slots', action='append', default=[], help='index=jobs, overrides --per-gpu for one GPU')
     parser.add_argument('--min-free-gb', type=float, default=15, help='start no stage below this much quota left')
     parser.add_argument('--resets', help='archive and log of restarted sessions (default: <root parent>_resets)')
