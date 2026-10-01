@@ -15,6 +15,9 @@ configuration, so a Codex run never shares an agent identity with an API run):
 * Arguments that fail a tool's JSON schema are returned to the model as a tool error.
   Strict function calling made them impossible in the Responses loop.
 * ``max_output_tokens`` is left to Codex.
+* A turn that fails for a transient provider reason is continued in the same thread with
+  ``CONTINUE`` after the Responses transport's bounded delays (at most seven times per
+  session). A session that ended before its first tool call may be started again.
 
 Sampling requests are counted as tool calls plus model turns that end without one, against
 the same ``max_api_calls`` budget. Once ``tools.done()`` holds, the turn is interrupted so no
@@ -34,6 +37,11 @@ import jsonschema
 from .journal import atomic, encode
 
 CONTINUE = "Continue with the tools."
+# Provider conditions that leave the thread intact; the session continues after the same
+# bounded delays as the Responses transport (appl.api.DEFAULT_DELAYS).
+TRANSIENT = ("serverOverloaded", "rateLimitExceeded", "internalServerError", "httpConnectionFailed",
+             "responseStreamConnectionFailed", "responseStreamDisconnected", "responseTooManyFailedAttempts")
+RETRY_DELAYS = (5, 10, 20, 40, 60, 60, 60)
 # Codex features that would give the agent capabilities outside the APPL tools.
 DISABLED_FEATURES = (
     "apps", "browser_use", "browser_use_external", "browser_use_full_cdp_access",
@@ -164,7 +172,9 @@ def run_session(loop, message, budget):
     """Run ``loop.tools`` to completion in one Codex thread; mirrors ``AgentLoop.run``."""
     j, tools, client = loop.journal, loop.tools, loop.client
     if j.get("codex_session_started") and not tools.done():
-        raise RuntimeError("An earlier Codex session ended unfinished; no automatic retry")
+        if j.get("codex_tool_calls", 0):
+            raise RuntimeError("An earlier Codex session ended unfinished; no automatic retry")
+        j.event("codex_session_restarted", reason="previous session made no tool call")
     if tools.done():
         return j.get("frozen")
     root = j.root / "codex"
@@ -175,7 +185,7 @@ def run_session(loop, message, budget):
     schemas = tools.schemas()
     definitions = {s["name"]: s for s in schemas}
     server = _Server(workspace, root / "app_server.log")
-    calls = turns = 0
+    calls = turns = retries = 0
     usage = None
 
     def note(kind, **payload):
@@ -221,6 +231,7 @@ def run_session(loop, message, budget):
                     server.respond(event["id"], error=dict(code=-32000, message="API call budget exhausted"))
                     raise ValueError("API call budget exhausted")
                 calls += 1
+                j.set("codex_tool_calls", j.get("codex_tool_calls", 0) + 1)
                 name, arguments = params["tool"], params["arguments"]
                 note("tool_call", call_id=params["callId"], tool=name, arguments=arguments)
                 if name not in definitions:
@@ -258,11 +269,20 @@ def run_session(loop, message, budget):
                 if limits and float(limits.get("usedPercent", 0)) >= 99:
                     raise CodexStop("Codex plan window nearly exhausted during a session")
             elif method == "turn/completed":
-                turns += 1
                 status = params["turn"].get("status")
                 note("turn_completed", status=status, error=params["turn"].get("error"))
                 if status == "failed":
-                    raise RuntimeError("Codex turn failed: " + encode(params["turn"].get("error")))
+                    error = params["turn"].get("error") or {}
+                    info = error.get("codexErrorInfo")
+                    kind = info if isinstance(info, str) else next(iter(info or {}), None)
+                    if kind in TRANSIENT and retries < len(RETRY_DELAYS):
+                        j.event("codex_transient_failure", kind=kind, retry=retries + 1)
+                        time.sleep(RETRY_DELAYS[retries])
+                        retries += 1
+                        start_turn(CONTINUE)
+                        continue
+                    raise RuntimeError("Codex turn failed: " + encode(error))
+                turns += 1
                 if tools.done():
                     break
                 if calls + turns >= budget:
@@ -277,6 +297,6 @@ def run_session(loop, message, budget):
             j.event("codex_plan_usage", stage="end", **quota)
         except Exception:  # the session outcome matters more than the final usage read
             quota = None
-        j.event("codex_session", tool_calls=calls, continued_turns=turns, usage=usage,
+        j.event("codex_session", tool_calls=calls, continued_turns=turns, transient_retries=retries, usage=usage,
                 done=bool(tools.done()), plan_usage=quota)
         server.close()
