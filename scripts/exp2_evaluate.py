@@ -33,7 +33,14 @@ def run(args):
     root = Path(args.root).resolve()
     gpus = itertools.cycle(args.gpu)
     lock = threading.Lock()
-    episodes = [e for e in published() if not args.suites or e['suite'] in args.suites]
+    episodes = [e for e in published() if (not args.suites or e['suite'] in args.suites)
+                and (not args.tasks or e['task'] in args.tasks)]
+    if args.construction_root:
+        # An episode against an unfinished library fails and is never re-run, so skip such tasks.
+        ready = {task for task in {e['task'] for e in episodes} if library_ready(Path(args.construction_root)/task)}
+        for task in sorted({e['task'] for e in episodes} - ready):
+            print(json.dumps(dict(skipped_task=task, reason='construction library incomplete')), flush=True)
+        episodes = [e for e in episodes if e['task'] in ready]
 
     def one(episode):
         out = root/episode['suite']/episode['task']/episode['case_id']
@@ -66,6 +73,14 @@ def run(args):
 
     with ThreadPoolExecutor(args.sessions) as pool:
         list(pool.map(one, episodes))
+
+
+def library_ready(run):
+    manifest = run/'cut/manifest.json'
+    if not manifest.exists():
+        return False
+    skills = [row['skill_id'] for row in json.loads(manifest.read_text())['datasets']]
+    return all((run/'library'/skill/'receipt.json').exists() for skill in skills)
 
 
 def outcomes(root):
@@ -120,6 +135,7 @@ def main():
     r.add_argument('--gpu', type=int, action='append', required=True)
     r.add_argument('--sessions', type=int, default=4)
     r.add_argument('--suites', nargs='*', choices=SUITES)
+    r.add_argument('--tasks', nargs='*', help='evaluate only these tasks')
     s = sub.add_parser('summary')
     s.add_argument('--root', action='append', default=[])
     args = parser.parse_args()
