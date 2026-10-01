@@ -84,15 +84,42 @@ def library_ready(run):
 
 
 def outcomes(root):
+    """Completed episodes, plus episodes whose agent exhausted its request budget.
+
+    APPL's agent loop ends an episode that uses all its model requests without a result file
+    (only failure.json). That is the agent's outcome, scored unsuccessful at the final state;
+    first attainment is read from the per-step trace. Other errors stay unscored (incomplete).
+    """
     rows = {}
     for episode in published():
-        path = Path(root)/episode['suite']/episode['task']/episode['case_id']/'result.json'
-        if path.exists():
-            result = json.loads(path.read_text())
+        folder = Path(root)/episode['suite']/episode['task']/episode['case_id']
+        key = (episode['suite'], episode['task'], episode['case_id'])
+        if (folder/'result.json').exists():
+            result = json.loads((folder/'result.json').read_text())
             if result['paired_initial_sha256'] != episode['paired_initial_sha256']:
-                raise ValueError('Initial state differs from the published pair: '+str(path))
-            rows[(episode['suite'], episode['task'], episode['case_id'])] = result
+                raise ValueError('Initial state differs from the published pair: '+str(folder))
+            rows[key] = result
+        elif (folder/'failure.json').exists():
+            failure = json.loads((folder/'failure.json').read_text())
+            if 'budget exhausted' not in failure.get('error', ''):
+                continue
+            first = None
+            for trace in (folder/'api/trace.jsonl', folder/'trace.jsonl'):
+                if trace.exists():
+                    for line in trace.read_text().splitlines():
+                        event = json.loads(line)
+                        if (event.get('metrics') or {}).get('success'):
+                            first = event.get('step')
+                            break
+                    break
+            rows[key] = dict(success=False, first_attainment_success=first is not None, first_success_step=first,
+                             status='request_budget_exhausted', steps=failure.get('physical_steps'))
     return rows
+
+
+def incomplete(root):
+    return sorted(str(p.parent.relative_to(root)) for p in Path(root).glob('*/*/*/failure.json')
+                  if 'budget exhausted' not in json.loads(p.read_text()).get('error', ''))
 
 
 def summary(args):
@@ -113,6 +140,11 @@ def summary(args):
                          + ('' if len(done) == len(keys) else f' (of {len(keys)})'))
         lines.append(f'| {name} | ' + ' | '.join(cells) + f' | {len(table)} |')
     print('\n'.join(lines))
+    for root in args.root:
+        exhausted = sum(r.get('status') == 'request_budget_exhausted' for r in outcomes(root).values())
+        missing = incomplete(root)
+        print(f'{Path(root).name}: {exhausted} episodes ended by the request budget (scored unsuccessful); '
+              f'{len(missing)} incomplete for other reasons' + (': '+', '.join(missing) if missing else ''))
     if len(columns) > 1:
         for name, table in columns[1:]:
             for other_name, other in columns:
